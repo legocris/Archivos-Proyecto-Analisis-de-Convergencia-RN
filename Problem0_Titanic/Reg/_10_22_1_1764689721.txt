@@ -1,0 +1,28 @@
+
+Arquitectura: _10_22_1_
+Semilla: 1764689721
+Segundos: 9
+NIteraciones: 70000
+
+Costo_train: 0.099588
+Precision_train: 0.911504
+Recall_train: 0.751825
+F1_train: 0.824000
+
+Costo_test: 0.124052
+Precision_test: 0.870370
+Recall_test: 0.691176
+F1_test: 0.770492
+ 
+Paso: 0.200000
+Gamma: 0.000000
+Parada: 0.100000
+Iteraciones: 1000000
+CapasDesde: 2
+CapasHasta: 3
+Repeticiones: 5
+Intervalo: 10000
+MultiplicadorProfunda: 0.700000
+
+Costos:
+0.1484330.1247250.1146000.1100710.1066740.1054450.099588
