@@ -1,0 +1,18 @@
+
+Arquitectura: _2_6_1_
+Semilla: 1764687216
+Segundos: 2
+Iteraciones: 10000
+
+Costo_train: 0.015150
+Precision_train: 0.986163
+Recall_train: 0.987406
+F1_train: 0.986784
+
+Costo_test: 0.012966
+Precision_test: 0.995098
+Recall_test: 0.985437
+F1_test: 0.990244
+
+Costos:
+0.015150

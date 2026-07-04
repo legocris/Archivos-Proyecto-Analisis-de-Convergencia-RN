@@ -1,0 +1,578 @@
+#include <cstdlib>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <stdio.h>
+#include <time.h>
+
+float Paso = 0.2;
+float Gamma = 0.0;
+float Parada = 0.1;
+int Iteraciones = 1000000;
+int CapasDesde = 2; //Desde 2
+int CapasHasta = 3; // Hasta 2
+int Repeticiones = 5;
+int Intervalo = 10000;
+float MultiProfunda = 0.7;
+
+cudaDeviceProp Prop;
+
+int sprintConfig(char* str){
+    int offset = 0;
+    offset += sprintf(str+offset, "Paso: %f\n", Paso);
+    offset += sprintf(str+offset, "Gamma: %f\n", Gamma);
+    offset += sprintf(str+offset, "Parada: %f\n", Parada);
+    offset += sprintf(str+offset, "Iteraciones: %d\n", Iteraciones);
+    offset += sprintf(str+offset, "CapasDesde: %d\n", CapasDesde);
+    offset += sprintf(str+offset, "CapasHasta: %d\n", CapasHasta);
+    offset += sprintf(str+offset, "Repeticiones: %d\n", Repeticiones);
+    offset += sprintf(str+offset, "Intervalo: %d\n", Intervalo);
+    offset += sprintf(str+offset, "MultiplicadorProfunda: %f\n", MultiProfunda);
+    offset += sprintf(str+offset, "Tarjeta: %s\n", Prop.name);
+    return offset;
+}
+
+
+void traspose(float *B, float *A, int n, int m){
+    for(int i = 0; i < n; i++){
+        for(int j = 0; j < m; j++){
+            B[j*n+i] = A[i*m+j];
+        }
+    }
+}
+
+void printMatrix(float *A, int n, int m){
+    for(int i = 0; i < n; i++){
+        for(int j = 0; j < m; j++){
+            printf("%.9f ", A[i*m+j]);
+        }
+        printf("\n");
+    }
+}
+
+void printMatrixColumn(float *A, int n, int m){
+    for(int i = 0; i < n; i++){
+        for(int j = 0; j < m; j++){
+            printf("%.9f ", A[i+j*n]);
+        }
+        printf("\n");
+    }
+}
+
+__global__ void cuSigmoid(float *out, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float x= out[tid];
+
+    //Bajo condiciones ideales, podríamos evitar este check
+    if (tid < total){
+        out[tid] = 1.0f / (1.0f + exp(-x));
+    }
+}
+
+__global__ void cuDSigmoidHadamard(float *out, float *A, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float x = out[tid], y = A[tid];
+
+    if (tid < total){
+      out[tid] = y * (1.0f - y) * x;
+    }
+}
+
+__global__ void cuCopyRepeated(float *out, float *A, int n, int total) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < total){
+      out[tid] = A[tid%n];
+    }
+}
+
+float costo(float *y, float *yhat, int n){
+    float sum = 0;
+    for(int i=0; i<n; i++){
+        sum += (y[i]-yhat[i])*(y[i]-yhat[i]);
+    }
+    return sum;
+}
+
+float score(float* y, float* yhat, int M, float* _returns ){
+    int P = 0;
+    for(int i=0; i<M; i++){
+        if(y[i]>0.5) P++;
+    }
+    int PP=0;
+    for(int i=0; i<M; i++){
+        if(yhat[i]>0.5) PP++;
+    }
+    int TP = 0;
+    for(int i=0; i<M; i++){
+        if(y[i]>0.5 && yhat[i]>0.5) TP++;
+    }
+    float precision = (float)TP/(float)P;
+
+    int FN = 0;
+    for(int i=0; i<M; i++){
+        if(y[i]<0.5 && yhat[i]>0.5) FN++;
+    }
+    float recall = (float)TP/(float)(PP);
+
+    float f1 = 2.0f*precision*recall/(precision+recall);
+      
+    _returns[0] = f1;
+    _returns[1] = precision;
+    _returns[2] = recall;
+
+    
+    return f1;
+}
+
+int main_test(int M, int m, int L, const int* dim) {
+    time_t semilla = time(NULL);
+    srand(semilla * 1000000);
+
+    //Datos de entrada
+    FILE* fp;
+    //char fname[32];
+    char fpath[32];
+    
+    int N = dim[0]; //Alto (entradas)
+    //int M; //Ancho (ejemplos)
+    int K = dim[L-1]; //Salidas
+    //int L; //Número de capas
+    //int dim[L]; Arquitecture Neuronas {N,...,K}
+    //int m; //Ancho Test
+
+    sprintf(fpath, "Bin/Train/X/%dx%d.bin", N, M);
+    fp = fopen(fpath, "rb");
+    float* X = (float*)malloc(sizeof(float) * N * M);
+    fread(X, sizeof(float), N * M, fp);
+    fclose(fp);
+
+    sprintf(fpath, "Bin/Train/Y/%dx%d.bin", K, M);
+    fp = fopen(fpath, "rb");
+    float* yhat = (float*)malloc(sizeof(float) * K * M);
+    fread(yhat, sizeof(float), K * M, fp);
+    fclose(fp);
+
+    int l = L-1;
+
+    //Preparación de datos para el backpropagation
+    //Los PESOS
+    float **h_W = (float**)malloc(sizeof(float*) * l);
+    float **h_WV = (float**)malloc(sizeof(float*) * l);
+    float **h_B = (float**)malloc(sizeof(float*) * l);
+    float **h_BV = (float**)malloc(sizeof(float*) * l);
+    float **d_W = (float**)malloc(sizeof(float*) * l);
+    float **d_WV = (float**)malloc(sizeof(float*) * l);
+    float **d_B = (float**)malloc(sizeof(float*) * l);
+    float **d_BV = (float**)malloc(sizeof(float*) * l);
+    
+    for(int i=0; i<l; i++){
+      float limite = sqrt(6.0f/(dim[i]+dim[i+1]));
+      h_W[i] = (float*)malloc(sizeof(float) * dim[i] * dim[i+1]);
+      h_WV[i] = (float*)malloc(sizeof(float) * dim[i] * dim[i+1]);
+      h_B[i] = (float*)malloc(sizeof(float) * dim[i+1]);
+      h_BV[i] = (float*)malloc(sizeof(float) * dim[i+1]);
+      
+      //Inicializar pesos con valores aleatorios [-limite,limite]
+      for (int j = 0; j < dim[i] * dim[i+1]; j++) {
+	h_W[i][j] = ( (float) (static_cast<float>(rand())/RAND_MAX)*2.0-1.0 )*limite;
+	h_WV[i][j] = 0.0;
+      }
+      
+      for (int j = 0; j < dim[i+1]; j++) {
+	h_B[i][j] = 0.0;
+	h_BV[i][j] = 0.0;
+      }
+
+      //En la cpu
+      cudaMalloc(&d_W[i], dim[i] * dim[i+1] * sizeof(float));
+      cudaMemcpy(d_W[i], h_W[i], dim[i] * dim[i+1] * sizeof(float), cudaMemcpyHostToDevice);
+      
+      cudaMalloc(&d_WV[i], dim[i] * dim[i+1] * sizeof(float));
+      cudaMemcpy(d_WV[i], h_W[i], dim[i] * dim[i+1] * sizeof(float), cudaMemcpyHostToDevice);
+      
+      cudaMalloc(&d_B[i], dim[i+1] * sizeof(float));
+      cudaMemcpy(d_B[i], h_B[i], dim[i+1] * sizeof(float), cudaMemcpyHostToDevice);
+      
+      cudaMalloc(&d_BV[i], dim[i+1] * sizeof(float));
+      cudaMemcpy(d_BV[i], h_B[i], dim[i+1] * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    //Variables temporales para el backpropagation
+    float *d_yhat;
+    cudaMalloc(&d_yhat,       dim[l] * M * sizeof(float));
+    cudaMemcpy(d_yhat , yhat, dim[l] * M * sizeof(float), cudaMemcpyHostToDevice);
+    
+    float *y = (float*)malloc(sizeof(float) * M);
+    float **d_ev, **d_d;
+    d_ev = (float**)malloc(sizeof(float*) * L);
+    d_d  = (float**)malloc(sizeof(float*) * (L-1));
+
+    float **h_ev = (float**)malloc(sizeof(float*) * L);
+
+    for(int i=0; i<L; i++){
+        cudaMalloc(&d_ev[i],  dim[i] * M * sizeof(float));
+        h_ev[i] = (float*)malloc( dim[i] * M * sizeof(float));
+    }
+
+    cudaMemcpy(d_ev[0], X,    dim[0] * M * sizeof(float), cudaMemcpyHostToDevice);
+
+    for(int i=0; i<L-1; i++){
+        cudaMalloc(&d_d[i],  dim[i+1] * M * sizeof(float));
+    }
+
+    //Esta matriz Identidad es últil
+    float *h_ID1 = (float*)malloc(sizeof(float) * 1 * 1);
+    for (int i = 0; i < 1 * 1; i++) {
+        h_ID1[i] = 1.0; //IdentidadF
+    }
+    float *d_ID1;
+    cudaMalloc(&d_ID1 , 1 * 1 * sizeof(float));
+    cudaMemcpy(d_ID1, h_ID1  , 1 * 1 * sizeof(float), cudaMemcpyHostToDevice);
+
+    //Este a matriz Identidad es últil
+    float *h_1M = (float*)malloc(sizeof(float) * 1 * M);
+    for (int i = 0; i < 1 * M; i++) {
+        h_1M[i] = 1.0; //IdentidadF
+    }
+    float *d_1M;
+    cudaMalloc(&d_1M , 1 * M * sizeof(float));
+    cudaMemcpy(d_1M, h_1M, 1 * M * sizeof(float), cudaMemcpyHostToDevice);
+    
+    //AHORA SÍ
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    char* costos = (char*)malloc(sizeof(char) * (Iteraciones/Intervalo)*10);
+    int offset_cost = 0;
+
+    float multi = powf(MultiProfunda, L-3);
+
+    int n;
+    for(n = 0; n < Iteraciones; n++){
+        //Preparamos con la evaluación completa de red
+
+        //SGEMM: C = aAB+bC
+        float alpha = 1.0f, beta = 1.0f;
+        for(int i=0; i<l; i++){
+	    cuCopyRepeated<<<(M*dim[i+1]+255)/256, 256>>>(d_ev[i+1], d_B[i], dim[i+1], dim[i+1] * M);
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, dim[i+1], M, dim[i], &alpha, d_W[i], dim[i+1], d_ev[i], dim[i], &beta, d_ev[i+1], dim[i+1]);
+            cuSigmoid<<<(M*dim[i+1]+255)/256, 256>>>(d_ev[1+i], dim[i+1] * M);
+        }
+
+        //IMPRIMIR
+        if (n % Intervalo == 0 && n>0) {
+            printf("Iteración %d\n", n);
+            cudaMemcpy(y, d_ev[l], dim[l]*M*sizeof(float), cudaMemcpyDeviceToHost);
+	    
+	    float cuesta = costo(y, yhat, M)/M;
+	    offset_cost += sprintf(costos+offset_cost, "%f", cuesta);
+            printf("Costo: %f\n", cuesta);
+	    if (cuesta < Parada)
+	      break;
+        }
+        
+        //Backpropagation formal.
+        
+	alpha = 1.0f; beta = -1.0f;
+	cublasSgeam(handle, CUBLAS_OP_N, CUBLAS_OP_N, dim[l], M, &alpha, d_ev[l], dim[l], &beta,  d_yhat,  dim[l], d_d[l-1], dim[l]);
+	
+        cuDSigmoidHadamard<<<(M*dim[l]+255)/256, 256>>>(d_d[l-1], d_ev[l], dim[l] * M);
+	
+        //Ahora sí en automático
+        alpha=1.0f; beta = 0.0f;
+        for(int i=0; i<l-1; i++){
+            cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, dim[l-i-1], M, dim[l-i]  , &alpha, d_W[l-i-1], dim[l-i]  , d_d[l-i-1], dim[l-i], &beta, d_d[l-i-2], dim[l-i-1]);
+            cuDSigmoidHadamard<<<(M*dim[l-i-1]+255)/256, 256>>>(d_d[l-i-2], d_ev[l-i-1], dim[l-i-1] * M);
+        }
+
+	        //Terminamos con los gradiantes y actualizamos los pesos
+	float neg = -1.0;
+        alpha = (Paso*multi)/(M); beta = Gamma;
+        for(int i=0; i<l; i++){
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dim[i+1], dim[i], M, &alpha, d_d[i], dim[i+1], d_ev[i], dim[i], &beta, d_WV[i], dim[i+1]);
+	    cublasSaxpy(handle, dim[i+1]*dim[i], &neg, d_WV[i], 1, d_W[i], 1);
+	    
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, dim[i+1], 1, M, &alpha, d_d[i], dim[i+1], d_1M, 1, &beta, d_BV[i], dim[i+1]);
+	    cublasSaxpy(handle, dim[i+1], &neg, d_BV[i], 1, d_B[i], 1);
+	}
+    }
+
+    //Muestra el Train
+    // Copiar el resultado de la última capa a la CPU
+    float scores[3];
+    cudaMemcpy(y, d_ev[l], dim[l]*M*sizeof(float), cudaMemcpyDeviceToHost);
+    
+    
+    int offset_arq = 1;
+    char arquitectura[128] = "_";
+    for(int i=0; i<L; i++){
+      offset_arq += sprintf(arquitectura+offset_arq, "%d_", dim[i]);
+    }
+
+    int offset = 0;
+    
+    char buffer[1024];
+    offset += sprintf(buffer+offset, "\nArquitectura: %s\n", arquitectura);
+    offset += sprintf(buffer+offset, "Semilla: %ld\n", (long)(semilla));
+    offset += sprintf(buffer+offset, "Segundos: %ld\n", (long)(time(NULL)-semilla));
+    offset += sprintf(buffer+offset, "Iteraciones: %d\n", n);
+    
+    offset += sprintf(buffer+offset, "\nCosto_train: %f\n", costo(y, yhat, M)/M);
+    offset += score(y, yhat, M, scores);
+    offset += sprintf(buffer+offset, "Precision_train: %f\n", scores[1]);
+    offset += sprintf(buffer+offset, "Recall_train: %f\n", scores[2]);
+    offset += sprintf(buffer+offset, "F1_train: %f\n", scores[0]);
+    
+    
+    //EVALUAMOS EL TEST (ASUMIMOS m<=M)
+    sprintf(fpath, "Bin/Test/X/%dx%d.bin", N, m);
+    fp = fopen(fpath, "rb");
+    fread(X, sizeof(float), N * m, fp);
+    fclose(fp);
+
+    cudaMemcpy(d_ev[0], X, dim[0] * m * sizeof(float), cudaMemcpyHostToDevice);
+
+    sprintf(fpath, "Bin/Test/Y/%dx%d.bin", K, m);
+    fp = fopen(fpath, "rb");
+    fread(yhat, sizeof(float), K * m, fp);
+    fclose(fp);
+    
+    //Evaluando...
+    float alpha = 1.0f, beta = 1.0f;
+    for(int i=0; i<l; i++){
+       cuCopyRepeated<<<(m*dim[i+1]+255)/256, 256>>>(d_ev[i+1], d_B[i], dim[i+1], dim[i+1] * m);
+       cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, dim[i+1], m, dim[i], &alpha, d_W[i], dim[i+1], d_ev[i], dim[i], &beta, d_ev[i+1], dim[i+1]);
+       cuSigmoid<<<(m*dim[i+1]+255)/256, 256>>>(d_ev[1+i], dim[i+1] * m);
+    }
+
+    //Muestra el Test
+    cudaMemcpy(y, d_ev[l], dim[l]*m*sizeof(float), cudaMemcpyDeviceToHost);
+    offset += sprintf(buffer+offset, "\nCosto_test: %f\n", costo(y, yhat, m)/m);
+    score(y, yhat, m, scores);
+    offset += sprintf(buffer+offset, "Precision_test: %f\n", scores[1]);
+    offset += sprintf(buffer+offset, "Recall_test: %f\n", scores[2]);
+    offset += sprintf(buffer+offset, "F1_test: %f\n \n", scores[0]);
+    printf(buffer);
+
+    char nombre_archivo[128];
+    sprintf(nombre_archivo, "Reg/%s%ld.txt", arquitectura, (long)semilla);
+    fp = fopen(nombre_archivo, "w");
+    sprintConfig(buffer+offset*sizeof(char));
+    fprintf(fp, buffer);
+    fprintf(fp, "\nCostos:\n");
+    fprintf(fp, costos);
+    fclose(fp);
+      
+    cublasDestroy(handle);  // Destroy cuBLAS handle (optional)
+
+    //Synchronize to ensure kernel execution is complete
+    cudaDeviceSynchronize();
+
+    // Free memory
+    for(int i=0; i<L-1; i++){
+        cudaFree(d_W[i]);
+        free(h_W[i]);
+    }
+    cudaFree(d_yhat);
+    cudaFree(d_ID1);
+    cudaFree(d_1M);
+
+    for(int i=0; i<L; i++){
+        cudaFree(d_ev[i]);
+    }
+    cudaFree(d_yhat);
+    for(int i=0; i<L-1; i++){
+        cudaFree(d_d[i]);
+    }
+    free(X);
+    free(y);
+    free(yhat);
+    free(h_ID1);
+    free(h_1M);
+
+    return 0;
+}
+
+char* getFname(const char* fpath) {
+    FILE* fp;
+    static char fname[32]; 
+    char cmd[256]; 
+
+    #if defined(_WIN32)
+        sprintf(cmd, "cd \"%s\" && dir /b *.bin", fpath);
+        fp = _popen(cmd, "r");
+    #elif defined(__linux__)
+        sprintf(cmd, "cd \"%s\" && ls -1 *.bin", fpath);
+        fp = popen(cmd, "r");
+    #endif
+
+    fgets(fname, sizeof(fname), fp);
+
+    #if defined(_WIN32)
+        _pclose(fp);
+    #elif defined(__linux__)
+        pclose(fp);
+    #endif
+
+    return fname;
+}
+
+void mostrar_ayuda(const char *nombre_programa) {
+    printf("Uso: %s [OPCIONES]...\n", nombre_programa);
+    printf("Opciones (nombre corto | nombre largo):\n");
+    printf("  -p | --Paso         Valor de Paso (float). Actual: %f\n", Paso);
+    printf("  -g | --Gamma        Inercia Gamma (float). Actual: %f\n", Gamma);
+    printf("  -r | --Parada       Valor de Parada (float). Actual: %f\n", Parada);
+    printf("  -i | --Iteraciones  Número de Iteraciones (int). Actual: %d\n", Iteraciones);
+    printf("  -cd| --CapasDesde   Capas Iniciales Experimento (int). Actual: %d\n", CapasDesde);
+    printf("  -ch| --CapasHasta   Capas Finales Finales (int). Actual: %d\n", CapasHasta);
+    printf("  -R | --Repeticiones Número de Repeticiones Experimento (int). Actual: %d\n", Repeticiones);
+    printf("  -I | --Intervalo    Intervalo de registro (int). Actual: %d\n", Intervalo);
+    printf("  -h | --ayuda        Mostrar esta ayuda.\n");
+}
+
+int main(int argc, char *argv[]) {
+    // El bucle comienza en i=1 porque argv[0] es el nombre del programa
+    for (int i = 1; i < argc; i++) {
+        
+        // El argumento actual es el flag (ej: "-p" o "--Paso")
+        char *arg = argv[i];
+
+        // ------------------ 1. Paso (float) ------------------
+        if (strcmp(arg, "-p") == 0 || strcmp(arg, "--Paso") == 0) {
+            if (i + 1 < argc) {
+                Paso = atof(argv[++i]); // Incrementa 'i' para tomar el siguiente argumento como valor
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+	// ------------------ 1. Gamma (float) ------------------
+        else if (strcmp(arg, "-g") == 0 || strcmp(arg, "--Gamma") == 0) {
+            if (i + 1 < argc) {
+                Gamma = atof(argv[++i]); 
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 2. Parada (float) ------------------
+        else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--Parada") == 0) {
+            if (i + 1 < argc) {
+                Parada = atof(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 3. Iteraciones (int) ------------------
+        else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--Iteraciones") == 0) {
+            if (i + 1 < argc) {
+                Iteraciones = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 4. CapasDesde (int) ------------------
+        else if (strcmp(arg, "-cd") == 0 || strcmp(arg, "--CapasDesde") == 0) {
+            if (i + 1 < argc) {
+                CapasDesde = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 5. CapasHasta (int) ------------------
+        else if (strcmp(arg, "-ch") == 0 || strcmp(arg, "--CapasHasta") == 0) {
+            if (i + 1 < argc) {
+                CapasHasta = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 6. Repeticiones (int) ------------------
+        else if (strcmp(arg, "-R") == 0 || strcmp(arg, "--Repeticiones") == 0) {
+            if (i + 1 < argc) {
+                Repeticiones = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 7. Intervalo (int) ------------------
+        else if (strcmp(arg, "-I") == 0 || strcmp(arg, "--Intervalo") == 0) {
+            if (i + 1 < argc) {
+                Intervalo = atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+	// ------------------ 7. Multiplicadorprofunda (int) ------------------
+        else if (strcmp(arg, "-MP") == 0 || strcmp(arg, "--MultiProfunda") == 0) {
+            if (i + 1 < argc) {
+                MultiProfunda = atof(argv[++i]);
+            } else {
+                fprintf(stderr, "Error: El flag %s requiere un valor.\n", arg);
+                return 1;
+            }
+        }
+        // ------------------ 8. Ayuda ------------------
+        else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--ayuda") == 0) {
+            mostrar_ayuda(argv[0]);
+            return 0;
+        }
+        // ------------------ Argumento desconocido ------------------
+        else {
+            fprintf(stderr, "Error: Argumento desconocido: %s\n", arg);
+            mostrar_ayuda(argv[0]);
+            return 1;
+        }
+    }
+
+    cudaGetDeviceProperties(&Prop, 0);
+
+    
+    // --- LÓGICA PRINCIPAL ---
+    printf("--- Configuración Actual ---\n");
+    char config[512];
+    sprintConfig(config); 
+    printf("%s", config);
+    printf("----------------------------\n");
+   
+    int M, N, K, m;
+    
+    //Obtenemos los parametros a partir de los nombres de los archivos
+    printf("Dimensiones Datos\n");
+    
+    sscanf(getFname("Bin/Train/X"), "%dx%d", &N, &M);
+    printf("trainx: %dx%d \n", N, M);
+
+    sscanf(getFname("Bin/Train/Y"), "%dx%d", &K, &M);
+    printf("trainy: %dx%d \n", K, M);
+
+    sscanf(getFname("Bin/Test/X"), "%dx%d", &N, &m);
+    printf("test_x: %dx%d \n", N, m);
+
+    int dim1[3];
+    int dim2[100];
+    for(int i = CapasDesde; i<=CapasHasta; i++){
+      dim1[0] = N; dim1[1] = (N+K)*i; dim1[2] = K;
+      
+      dim2[0] = N; dim2[1+i] = K;
+      for(int t = 0; t<i; dim2[1+(t++)] = N+K){}
+      
+      for(int j = 0; j<Repeticiones; j++){
+	//Ahora sí, la prueba.
+	printf("\n\n--- Test Angosta %d.%d ---\n", i, j);
+	main_test(M, m, 3, dim1);
+
+	printf("\n\n--- Test Profunda %d.%d ---\n", i, j);
+	main_test(M, m, i+2, dim2);
+      }
+    }
+    
+    return 0;
+}

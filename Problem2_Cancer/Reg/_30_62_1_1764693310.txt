@@ -1,0 +1,29 @@
+
+Arquitectura: _30_62_1_
+Semilla: 1764693310
+Segundos: 30
+NIteraciones: 240000
+
+Costo_train: 0.092375
+Precision_train: 0.867692
+Recall_train: 0.986014
+F1_train: 0.923077
+
+Costo_test: 0.065266
+Precision_test: 0.909091
+Recall_test: 0.985915
+F1_test: 0.945946
+ 
+Paso: 0.200000
+Gamma: 0.000000
+Parada: 0.100000
+Iteraciones: 1000000
+CapasDesde: 2
+CapasHasta: 3
+Repeticiones: 5
+Intervalo: 10000
+MultiplicadorProfunda: 0.700000
+Tarjeta: NVIDIA GeForce GTX 950M
+
+Costos:
+0.2272190.2267900.2266440.2265770.2265370.2265110.2264930.2264780.2264690.2264610.2264550.2264490.2264450.2264420.2264390.2264370.2264340.2264320.2264290.2264280.2264260.2264240.2264240.092375

@@ -1,0 +1,10 @@
+
+Arquitectura: _2_9_1_
+Semilla: 1764936375
+Segundos: 2
+NIteraciones: 20000
+
+Costo_train: 0.022163
+
+Costos:
+0.2337600.022163
